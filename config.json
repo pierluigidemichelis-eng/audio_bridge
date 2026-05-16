@@ -1,0 +1,21 @@
+{
+  "target_ip": "192.168.2.181:3333",
+  "local_port": 3333,
+  "buffer_size_ms": 3360,
+  "selected_tab": "VPN",
+  "in_volume": 1.0,
+  "out_volume": 1.0,
+  "selected_in": "Default",
+  "selected_out": "Default",
+  "bitrate_kbps": 128,
+  "customer_name": "Pierluigi Demichelis",
+  "license_key": "32A2BCB2E799EB28",
+  "mode": "BOTH",
+  "autostart": true,
+  "vpn_enabled": true,
+  "vpn_private_key": "0BjufeWwET78Z5NmttBDzXxdYoU+sh1hZZZiNNpB5Ws=",
+  "vpn_peer_public_key": "JuILrH3pxixkfI7xQIu6dWbv2E763+vVkltq5PhSijQ=",
+  "vpn_endpoint": "rp0.demipl.it:51820",
+  "vpn_local_ip": "192.168.11.201",
+  "vpn_allowed_ips": "192.168.11.0/24"
+}

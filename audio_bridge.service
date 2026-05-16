@@ -1,0 +1,18 @@
+[Unit]
+Description=AudioTX PRO Bridge Engine
+After=network.target sound.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pierluigi/audiotx/audio_bridge
+# Rimosso --buffer: l'engine userà il valore letto dal config.json locale
+ExecStart=/home/pierluigi/audiotx/audio_bridge/audio_bridge
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+Cargo.lock
+gigi_release
+gigi_x86_64-pc-windows-gnu
+*.*.[0-9][0-9]
+*.no
+*.*:*
+
+main.tar.gz.old

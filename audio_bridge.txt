@@ -1,0 +1,585 @@
+********** Cargo.toml **********
+
+[package]
+name = "audio_bridge"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "audio_bridge"
+path = "src/main.rs"
+
+[lib]
+name = "audio_bridge"
+path = "src/main.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+image = { version = "0.24", features = ["png"] }
+egui_extras = { version = "0.27", features = ["all_loaders"] }
+egui_plot = "0.27"
+ringbuf = "0.3"
+
+# --- SEZIONE PC (Windows / Linux) ---
+[target.'cfg(not(target_os = "android"))'.dependencies]
+opus = "0.3.1"
+cpal = "0.15"
+machine-uid = "0.3"
+eframe = "0.27"
+
+# --- SEZIONE ANDROID ---
+[target.'cfg(target_os = "android")'.dependencies]
+cpal = "0.15" 
+eframe = { version = "0.27", features = ["android-native-activity"] }
+android-activity = { version = "0.5.2", features = ["native-activity"] }
+winit = { version = "0.29.15", features = ["android-native-activity"] } # <--- AGGIUNTA FONDAMENTALE
+
+[patch.crates-io]
+android-activity = { git = "https://github.com/rust-mobile/android-activity", rev = "v0.5.2" }
+
+[build-dependencies]
+winres = "0.1"
+
+[package.metadata.android]
+package = "com.audiotx.pro"
+label = "AudioTX Pro"
+assets = "assets"
+permissions = [
+    "android.permission.INTERNET",
+    "android.permission.RECORD_AUDIO",
+    "android.permission.MODIFY_AUDIO_SETTINGS"
+]
+
+[package.metadata.android.sdk]
+min_sdk_version = 21
+target_sdk_version = 33
+
+************* FINE FILE ************
+
+********** src/main.rs **********
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod gui;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use ringbuf::HeapRb;
+use std::net::UdpSocket;
+use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+use std::collections::BTreeMap;
+use sha2::{Sha256, Digest};
+use gui::{AudioCommand, Tab, AudioApp, Config};
+// --- SEZIONE PC: IMPORT REALE ---
+#[cfg(not(target_os = "android"))]
+use opus::{Encoder, Decoder, Application, Channels, Bitrate};
+
+// --- SEZIONE ANDROID: STRUTTURA FITTIZIA PER FAR COMPILARE SENZA ERRORI ---
+#[cfg(target_os = "android")]
+pub struct Encoder;
+#[cfg(target_os = "android")]
+pub struct Decoder;
+
+#[cfg(target_os = "android")]
+pub enum Application { Audio }
+#[cfg(target_os = "android")]
+pub enum Channels { Stereo }
+#[cfg(target_os = "android")]
+pub enum Bitrate { Bits(i32) }
+
+#[cfg(target_os = "android")]
+impl Encoder {
+    pub fn new(_: i32, _: Channels, _: Application) -> Result<Self, ()> { Ok(Encoder) }
+    pub fn set_bitrate(&mut self, _: Bitrate) -> Result<(), ()> { Ok(()) }
+    pub fn encode_float(&mut self, _: &[f32], _: &mut [u8]) -> Result<usize, ()> { Ok(0) }
+}
+
+#[cfg(target_os = "android")]
+impl Decoder {
+    pub fn new(_: i32, _: Channels) -> Result<Self, ()> { Ok(Decoder) }
+    pub fn decode_float(&mut self, _: &[u8], _: &mut [f32], _: bool) -> Result<usize, ()> { Ok(0) }
+}
+
+
+fn pack_bin(seq: u64, ctrl: u8, data: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(9 + data.len());
+    v.extend_from_slice(&seq.to_be_bytes()); v.push(ctrl); v.extend_from_slice(data); v
+}
+
+fn unpack_bin(buf: &[u8]) -> Option<(u64, u8, Vec<u8>)> {
+    if buf.len() < 9 { return None; }
+    let seq = u64::from_be_bytes(buf[0..8].try_into().ok()?);
+    let ctrl = buf[8]; let data = buf[9..].to_vec();
+    Some((seq, ctrl, data))
+}
+
+fn generate_hwid() -> String {
+    #[cfg(not(target_os = "android"))]
+    {
+        let uid = machine_uid::get().unwrap_or_else(|_| "UNKNOWN".into());
+        let mut h = Sha256::new(); h.update(uid.as_bytes());
+        format!("{:x}", h.finalize())[..12].to_uppercase()
+    }
+    
+    #[cfg(target_os = "android")]
+    {
+        "ANDROID_HWID".to_string()
+    }
+}
+
+fn verify_license_static(hwid: &str, name: &str, key: &str) -> bool {
+    if name.is_empty() || key.is_empty() { return false; }
+    let mut h = Sha256::new();
+    h.update(hwid.trim().to_uppercase().as_bytes()); h.update(name.trim().as_bytes());
+    h.update(b"MmcyS5isfQKEdMPnn3F6N1n4tFLbtjPjPvip6spNjg");
+    let expected = format!("{:x}", h.finalize())[..16].to_uppercase();
+    key.trim() == expected
+}
+
+fn wizard(h_id: &str) -> Config {
+    println!("\n=== CONFIGURAZIONE AUDIOTX PRO ===\nHWID: {}", h_id);
+    let mut cfg = Config { 
+        target_ip: "127.0.0.1:12345".into(), local_port: 12345, buffer_size_ms: 200, 
+        selected_tab: Tab::TX, in_volume: 1.0, out_volume: 1.0, 
+        selected_in: "Default".into(), selected_out: "Default".into(), 
+        bitrate_kbps: 128, customer_name: "".into(), license_key: "".into(), mode: "BOTH".into()
+    };
+    use std::io::{stdin, stdout, Write};
+    print!("Nome Cliente: "); stdout().flush().ok();
+    let mut n = String::new(); stdin().read_line(&mut n).ok(); cfg.customer_name = n.trim().to_string();
+    print!("Chiave Licenza: "); stdout().flush().ok();
+    let mut k = String::new(); stdin().read_line(&mut k).ok(); cfg.license_key = k.trim().to_string();
+    let _ = std::fs::write("config.json", serde_json::to_string_pretty(&cfg).unwrap());
+    cfg
+}
+
+fn start_audio_engine(
+    cfg: Config, cmd_rx: mpsc::Receiver<AudioCommand>, jitter_tx: mpsc::Sender<f64>,
+    input_lvls: [Arc<AtomicU32>; 2], output_lvls: [Arc<AtomicU32>; 2],
+    tk: Arc<AtomicU32>, rk: Arc<AtomicU32>, vi: Arc<AtomicU32>, vo: Arc<AtomicU32>,
+    ra: Arc<Mutex<String>>, lp: Arc<Mutex<Instant>>,
+) {
+    std::thread::spawn(move || {
+        let host = cpal::default_host();
+        let socket = UdpSocket::bind(format!("0.0.0.0:{}", cfg.local_port)).expect("Porta occupata");
+        socket.set_nonblocking(true).ok();
+        let (mut target, mut delay_pkts, mut active) = (cfg.target_ip.clone(), (cfg.buffer_size_ms / 20) as usize, false);
+
+        let current_prod_in = Arc::new(Mutex::new(None));
+        let current_cons_in = Arc::new(Mutex::new(None));
+        let current_prod_out = Arc::new(Mutex::new(None));
+        let current_cons_out = Arc::new(Mutex::new(None));
+
+        // DICHIARAZIONE DEGLI STREAM (Fix per E0425)
+        let mut _s_in: Option<cpal::Stream> = None;
+        let mut _s_out: Option<cpal::Stream> = None;
+
+        let mut enc = Encoder::new(48000, Channels::Stereo, Application::Audio).unwrap();
+        let mut dec = Decoder::new(48000, Channels::Stereo).unwrap();
+
+        let (mut seq_tx, mut j_map, mut last_bw) = (0u64, BTreeMap::new(), Instant::now());
+        let (mut b_tx, mut b_rx) = (0, 0);
+        let (mut pin, mut pout) = (Some(cfg.selected_in.clone()), Some(cfg.selected_out.clone()));
+
+        loop {
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    AudioCommand::SetTransmitting(s) => active = s,
+                    AudioCommand::UpdateTarget(t) => target = t,
+                    AudioCommand::UpdateBitrate(b) => { 
+                        let _ = enc.set_bitrate(Bitrate::Bits(b as i32 * 1024));
+                    },
+                    AudioCommand::UpdateBufferSize(ms) => { delay_pkts = (ms / 20) as usize; j_map.clear(); },
+                    AudioCommand::UpdateInputDevice(n) => pin = Some(n),
+                    AudioCommand::UpdateOutputDevice(n) => pout = Some(n),
+                    _ => {}
+                }
+            }
+
+            if let Some(n) = pin.take() {
+                if let Some(d) = host.input_devices().unwrap().find(|x| x.name().unwrap_or_default() == n).or(host.default_input_device()) {
+                    let conf = cpal::StreamConfig { channels: 2, sample_rate: cpal::SampleRate(48000), buffer_size: cpal::BufferSize::Fixed(960) };
+                    let (pi, ci) = HeapRb::<f32>::new(192000).split();
+                    *current_prod_in.lock().unwrap() = Some(pi);
+                    *current_cons_in.lock().unwrap() = Some(ci);
+                    let v = vi.clone(); let lv = input_lvls.clone(); let p_in_ptr = current_prod_in.clone();
+                    _s_in = d.build_input_stream(&conf, move |data: &[f32], _| {
+                        if let Some(ref mut pi) = *p_in_ptr.lock().unwrap() {
+                            let vol = f32::from_bits(v.load(Ordering::Relaxed));
+                            let mut pks = [0.0f32; 2];
+                            for (i, &s) in data.iter().enumerate() {
+                                let sa = s * vol; if i < 2 && sa.abs() > pks[i] { pks[i] = sa.abs(); }
+                                let _ = pi.push(sa);
+                            }
+                            lv[0].store(pks[0].to_bits(), Ordering::Relaxed); lv[1].store(pks[1].to_bits(), Ordering::Relaxed);
+                        }
+                    }, |_|{}, None).ok(); if let Some(ref s) = _s_in { s.play().ok(); }
+                }
+            }
+
+            if let Some(n) = pout.take() {
+                if let Some(d) = host.output_devices().unwrap().find(|x| x.name().unwrap_or_default() == n).or(host.default_output_device()) {
+                    let conf = cpal::StreamConfig { channels: 2, sample_rate: cpal::SampleRate(48000), buffer_size: cpal::BufferSize::Fixed(960) };
+                    let (pi, co) = HeapRb::<f32>::new(192000).split();
+                    *current_prod_out.lock().unwrap() = Some(pi);
+                    *current_cons_out.lock().unwrap() = Some(co);
+                    let v = vo.clone(); let lv = output_lvls.clone(); let c_out_ptr = current_cons_out.clone();
+                    _s_out = d.build_output_stream(&conf, move |data: &mut [f32], _| {
+                        if let Some(ref mut co) = *c_out_ptr.lock().unwrap() {
+                            let vol = f32::from_bits(v.load(Ordering::Relaxed));
+                            let mut pks = [0.0f32; 2];
+                            for (i, sa) in data.iter_mut().enumerate() {
+                                let s = co.pop().unwrap_or(0.0) * vol; *sa = s;
+                                if i < 2 && s.abs() > pks[i] { pks[i] = s.abs(); }
+                            }
+                            lv[0].store(pks[0].to_bits(), Ordering::Relaxed); lv[1].store(pks[1].to_bits(), Ordering::Relaxed);
+                        }
+                    }, |_|{}, None).ok(); if let Some(ref s) = _s_out { s.play().ok(); }
+                }
+            }
+
+            if active {
+                if let Some(ref mut ci) = *current_cons_in.lock().unwrap() {
+                    if ci.len() >= 1920 {
+                        let mut pcm = [0f32; 1920]; for s in pcm.iter_mut() { *s = ci.pop().unwrap_or(0.0); }
+                        let mut out_b = [0u8; 1500];
+                        #[cfg(not(target_os = "android"))]
+                        let encode_res = enc.encode_float(&pcm, &mut out_b);
+                        #[cfg(target_os = "android")]
+                        let encode_res = enc.encode_float(&pcm, &mut out_b).map_err(|_| opus::Error::from_code(0)); // fittizio
+                        if let Ok(sz) = encode_res {
+                            let pkt = pack_bin(seq_tx, 0, &out_b[..sz]);
+                            socket.send_to(&pkt, &target).ok(); b_tx += pkt.len(); seq_tx += 1;
+                        }
+                    }
+                }
+            }
+
+            let mut buf = [0u8; 2048];
+            while let Ok((n, addr)) = socket.recv_from(&mut buf) {
+                if let Some((seq, ctrl, data)) = unpack_bin(&buf[..n]) {
+                    if ctrl == 1 { j_map.clear(); }
+                    else {
+                        let ora = Instant::now(); let mut lp_lock = lp.lock().unwrap();
+                        let diff = ora.duration_since(*lp_lock).as_secs_f64() * 1000.0;
+                        *lp_lock = ora; *ra.lock().unwrap() = addr.to_string();
+                        j_map.insert(seq, data); b_rx += n; let _ = jitter_tx.send(diff.min(100.0));
+                    }
+                }
+            }
+
+            if j_map.len() >= delay_pkts {
+                if j_map.len() > delay_pkts + 3 { j_map.pop_first(); }
+                if let Some((_, data)) = j_map.pop_first() {
+                    if let Some(ref mut po) = *current_prod_out.lock().unwrap() {
+                        let mut opcm = [0f32; 1920];
+                        let res = dec.decode_float(&data, &mut opcm, false);
+                        if let Ok(sz) = res { for &s in &opcm[..sz * 2] { let _ = po.push(s); } }
+                    }
+                }
+            }
+
+            if last_bw.elapsed() >= Duration::from_secs(1) {
+                tk.store((b_tx * 8 / 1024) as u32, Ordering::Relaxed);
+                rk.store((b_rx * 8 / 1024) as u32, Ordering::Relaxed);
+                b_tx = 0; b_rx = 0; last_bw = Instant::now();
+            }
+            std::thread::sleep(Duration::from_nanos(10));
+        }
+    });
+}
+
+fn main() -> Result<(), eframe::Error> {
+    let hwid = generate_hwid();
+    let is_headless = std::env::args().any(|arg| arg == "--no-gui");
+    let cfg = if std::path::Path::new("config.json").exists() {
+        serde_json::from_str(&std::fs::read_to_string("config.json").unwrap_or_default()).unwrap_or_else(|_| wizard(&hwid))
+    } else { wizard(&hwid) };
+
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (jitter_tx, jitter_rx) = mpsc::channel();
+    let input_lvls = [Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0))];
+    let output_lvls = [Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0))];
+    let tx_k = Arc::new(AtomicU32::new(0)); let rx_k = Arc::new(AtomicU32::new(0));
+    let v_in = Arc::new(AtomicU32::new(cfg.in_volume.to_bits()));
+    let v_out = Arc::new(AtomicU32::new(cfg.out_volume.to_bits()));
+    let r_addr = Arc::new(Mutex::new("Nessuno".into()));
+    let l_pkt = Arc::new(Mutex::new(Instant::now()));
+    let auth = verify_license_static(&hwid, &cfg.customer_name, &cfg.license_key);
+
+    start_audio_engine(cfg.clone(), cmd_rx, jitter_tx, input_lvls.clone(), output_lvls.clone(), 
+                      tx_k.clone(), rx_k.clone(), v_in.clone(), v_out.clone(), r_addr.clone(), l_pkt.clone());
+
+    if is_headless {
+        println!("Headless Mode attivo... TX attivo.");
+        let _ = cmd_tx.send(AudioCommand::SetTransmitting(true));
+        loop { std::thread::sleep(Duration::from_secs(1)); }
+    }
+
+    let mut options = eframe::NativeOptions::default();
+    options.viewport = eframe::egui::ViewportBuilder::default().with_inner_size([550.0, 850.0]);
+    
+    eframe::run_native("AudioTX PRO", options, Box::new(move |cc| {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+        Box::new(AudioApp {
+            input_levels: input_lvls, output_levels: output_lvls, in_volume: v_in, out_volume: v_out,
+            tx_kbps: tx_k, rx_kbps: rx_k, selected_tab: cfg.selected_tab, input_devices: vec![],
+            output_devices: vec![], selected_in: cfg.selected_in, selected_out: cfg.selected_out, 
+            buffer_size_ms: cfg.buffer_size_ms, target_ip: cfg.target_ip, local_port: cfg.local_port, 
+            bitrate_kbps: cfg.bitrate_kbps, is_transmitting: false, command_tx: cmd_tx, 
+            latency_history: std::collections::VecDeque::new(), hwid, remote_addr: r_addr, 
+            last_packet_time: l_pkt, session_start: None, jitter_rx, 
+            customer_name: cfg.customer_name, license_key: cfg.license_key, is_licensed: auth, mode: cfg.mode,
+        })
+    }))
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+fn android_main(app: eframe::egui::AndroidApp) {
+    let hwid = generate_hwid();
+    let cfg = Config::default(); 
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (jitter_tx, jitter_rx) = mpsc::channel();
+    let input_lvls = [Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0))];
+    let output_lvls = [Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0))];
+    let tx_k = Arc::new(AtomicU32::new(0)); let rx_k = Arc::new(AtomicU32::new(0));
+    let v_in = Arc::new(AtomicU32::new(cfg.in_volume.to_bits()));
+    let v_out = Arc::new(AtomicU32::new(cfg.out_volume.to_bits()));
+    let r_addr = Arc::new(Mutex::new("Nessuno".into()));
+    let l_pkt = Arc::new(Mutex::new(Instant::now()));
+
+    start_audio_engine(cfg.clone(), cmd_rx, jitter_tx, input_lvls.clone(), output_lvls.clone(), 
+                      tx_k.clone(), rx_k.clone(), v_in.clone(), v_out.clone(), r_addr.clone(), l_pkt.clone());
+
+    let mut options = eframe::NativeOptions::default();
+    let _ = eframe::run_android_main(app, options, Box::new(move |cc| {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+        Box::new(AudioApp {
+            input_levels: input_lvls, output_levels: output_lvls, in_volume: v_in, out_volume: v_out,
+            tx_kbps: tx_k, rx_kbps: rx_k, selected_tab: cfg.selected_tab, input_devices: vec![],
+            output_devices: vec![], selected_in: cfg.selected_in, selected_out: cfg.selected_out, 
+            buffer_size_ms: cfg.buffer_size_ms, target_ip: cfg.target_ip, local_port: cfg.local_port, 
+            bitrate_kbps: cfg.bitrate_kbps, is_transmitting: false, command_tx: cmd_tx, 
+            latency_history: std::collections::VecDeque::new(), hwid, remote_addr: r_addr, 
+            last_packet_time: l_pkt, session_start: None, jitter_rx, 
+            customer_name: cfg.customer_name, license_key: cfg.license_key, is_licensed: true, mode: cfg.mode,
+        })
+    }));
+}
+
+************* FINE FILE ************
+
+********** src/gui.rs **********
+
+use eframe::egui;
+use egui_plot::{Line, Plot, PlotPoints};
+use std::sync::{Arc, Mutex, mpsc::Receiver, mpsc::Sender};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::collections::VecDeque;
+use sha2::{Sha256, Digest};
+use serde::{Serialize, Deserialize};
+
+#[derive(PartialEq, Serialize, Deserialize, Clone, Copy)]
+pub enum Tab { TX, RX }
+
+pub enum AudioCommand {
+    UpdateTarget(String), UpdateBufferSize(u32), UpdateLocalPort(u16),
+    SetTransmitting(bool), UpdateInputDevice(String), UpdateOutputDevice(String),
+    UpdateBitrate(u32), UpdateAuth(bool),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Config {
+    pub target_ip: String, pub local_port: u16, pub buffer_size_ms: u32,
+    pub selected_tab: Tab, pub in_volume: f32, pub out_volume: f32,
+    pub selected_in: String, pub selected_out: String,
+    pub bitrate_kbps: u32, pub customer_name: String, pub license_key: String,
+    pub mode: String,
+}
+
+pub struct AudioApp {
+    pub input_levels: [Arc<AtomicU32>; 2], pub output_levels: [Arc<AtomicU32>; 2],
+    pub in_volume: Arc<AtomicU32>, pub out_volume: Arc<AtomicU32>,
+    pub tx_kbps: Arc<AtomicU32>, pub rx_kbps: Arc<AtomicU32>,
+    pub selected_tab: Tab, pub input_devices: Vec<String>, pub output_devices: Vec<String>,
+    pub selected_in: String, pub selected_out: String,
+    pub buffer_size_ms: u32, pub target_ip: String, pub local_port: u16,
+    pub bitrate_kbps: u32, pub is_transmitting: bool,
+    pub command_tx: Sender<AudioCommand>, pub latency_history: VecDeque<f64>,
+    pub hwid: String, pub remote_addr: Arc<Mutex<String>>,
+    pub last_packet_time: Arc<Mutex<std::time::Instant>>, pub session_start: Option<std::time::Instant>,
+    pub jitter_rx: Receiver<f64>,
+    pub customer_name: String, pub license_key: String, pub is_licensed: bool,
+    pub mode: String,
+}
+
+impl eframe::App for AudioApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.set_visuals(egui::Visuals::dark());
+        while let Ok(v) = self.jitter_rx.try_recv() {
+            if v < 0.0 { self.latency_history.clear(); }
+            else {
+                self.latency_history.push_back(v);
+                if self.latency_history.len() > 300 { self.latency_history.pop_front(); }
+            }
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add(egui::Image::new(egui::include_image!("../logo.png")).max_width(240.0));
+                ui.add_space(5.0);
+                ui.heading(egui::RichText::new("AudioTX PRO").strong().color(egui::Color32::LIGHT_BLUE));
+            });
+            ui.add_space(10.0);
+
+            if !self.is_licensed {
+                ui.group(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label("🔒 ATTIVAZIONE RICHIESTA");
+                        if ui.button(format!("HWID: {}", self.hwid)).clicked() { ui.output_mut(|o| o.copied_text = self.hwid.clone()); }
+                        ui.horizontal(|ui| { ui.label("Cliente:"); ui.text_edit_singleline(&mut self.customer_name); });
+                        ui.horizontal(|ui| { ui.label("Chiave:"); ui.text_edit_singleline(&mut self.license_key); });
+                        if ui.button("ATTIVA").clicked() { 
+                            if self.verify_license() { self.is_licensed = true; let _ = self.command_tx.send(AudioCommand::UpdateAuth(true)); self.force_save(); }
+                        }
+                    });
+                });
+            } else {
+                ui.columns(2, |cols| {
+                    cols[0].vertical_centered(|ui| { ui.selectable_value(&mut self.selected_tab, Tab::TX, "📤 TRASMISSIONE"); });
+                    cols[1].vertical_centered(|ui| { ui.selectable_value(&mut self.selected_tab, Tab::RX, "📥 RICEZIONE"); });
+                });
+                ui.separator();
+                match self.selected_tab {
+                    Tab::TX => self.show_tx(ui),
+                    Tab::RX => { self.show_rx(ui); self.show_latency_plot(ui); }
+                }
+            }
+        });
+        ctx.request_repaint();
+    }
+}
+
+impl AudioApp {
+    pub fn force_save(&self) {
+        let cfg = Config {
+            target_ip: self.target_ip.clone(), local_port: self.local_port, buffer_size_ms: self.buffer_size_ms,
+            selected_tab: self.selected_tab, in_volume: f32::from_bits(self.in_volume.load(Ordering::Relaxed)),
+            out_volume: f32::from_bits(self.out_volume.load(Ordering::Relaxed)),
+            selected_in: self.selected_in.clone(), selected_out: self.selected_out.clone(),
+            bitrate_kbps: self.bitrate_kbps, customer_name: self.customer_name.clone(),
+            license_key: self.license_key.clone(), mode: self.mode.clone(),
+        };
+        let _ = std::fs::write("config.json", serde_json::to_string_pretty(&cfg).unwrap());
+    }
+
+    pub fn verify_license(&self) -> bool {
+        if self.customer_name.is_empty() || self.license_key.is_empty() { return false; }
+        let mut hasher = Sha256::new();
+        hasher.update(self.hwid.trim().to_uppercase().as_bytes());
+        hasher.update(self.customer_name.trim().as_bytes());
+        hasher.update(b"MmcyS5isfQKEdMPnn3F6N1n4tFLbtjPjPvip6spNjg"); 
+        let expected = format!("{:x}", hasher.finalize())[..16].to_uppercase();
+        self.license_key.trim() == expected
+    }
+
+    fn show_tx(&mut self, ui: &mut egui::Ui) {
+        let (txt, col) = if self.is_transmitting { ("🔴 STOP TX", egui::Color32::from_rgb(150,0,0)) } else { ("🟢 START TX", egui::Color32::from_rgb(0,120,0)) };
+        if ui.add_sized([ui.available_width(), 40.0], egui::Button::new(txt).fill(col)).clicked() {
+            self.is_transmitting = !self.is_transmitting;
+            let _ = self.command_tx.send(AudioCommand::SetTransmitting(self.is_transmitting));
+        }
+        ui.add_space(10.0);
+        ui.add_enabled_ui(!self.is_transmitting, |ui| {
+            ui.group(|ui| {
+                ui.spacing_mut().slider_width = 300.0;
+                egui::ComboBox::from_label("Mic").width(300.0).selected_text(&self.selected_in).show_ui(ui, |ui| {
+                    for d in &self.input_devices { if ui.selectable_value(&mut self.selected_in, d.clone(), d).clicked() { let _ = self.command_tx.send(AudioCommand::UpdateInputDevice(self.selected_in.clone())); self.force_save(); }}
+                });
+                egui::ComboBox::from_label("Bitrate").width(300.0).selected_text(format!("{}k", self.bitrate_kbps)).show_ui(ui, |ui| {
+                    for &r in &[64, 96, 128, 192, 256, 320] { if ui.selectable_value(&mut self.bitrate_kbps, r, format!("{}k", r)).clicked() { let _ = self.command_tx.send(AudioCommand::UpdateBitrate(r)); self.force_save(); }}
+                });
+                ui.horizontal(|ui| { ui.label("Dest:"); ui.text_edit_singleline(&mut self.target_ip); });
+            });
+        });
+        ui.group(|ui| {
+            ui.label(format!("🚀 TX: {} kbps", self.tx_kbps.load(Ordering::Relaxed)));
+            let mut v = f32::from_bits(self.in_volume.load(Ordering::Relaxed));
+            if ui.add(egui::Slider::new(&mut v, 0.0..=2.0).text("Mic Gain")).changed() { self.in_volume.store(v.to_bits(), Ordering::Relaxed); self.force_save(); }
+            for i in 0..2 { ui.add(egui::ProgressBar::new(f32::from_bits(self.input_levels[i].load(Ordering::Relaxed)).min(1.0)).desired_width(350.0)); }
+        });
+        self.show_info_box(ui);
+    }
+
+    fn show_rx(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.spacing_mut().slider_width = 300.0;
+            egui::ComboBox::from_label("Out").width(300.0).selected_text(&self.selected_out).show_ui(ui, |ui| {
+                for d in &self.output_devices { if ui.selectable_value(&mut self.selected_out, d.clone(), d).clicked() { let _ = self.command_tx.send(AudioCommand::UpdateOutputDevice(self.selected_out.clone())); self.force_save(); }}
+            });
+            ui.horizontal(|ui| { ui.label("Porta:"); if ui.add(egui::DragValue::new(&mut self.local_port)).changed() { self.force_save(); } });
+            ui.horizontal(|ui| { ui.label(format!("RX {} kbps", self.rx_kbps.load(Ordering::Relaxed))); ui.small(format!(" Da: {}", self.remote_addr.lock().unwrap())); });
+            let mut v = f32::from_bits(self.out_volume.load(Ordering::Relaxed));
+            if ui.add(egui::Slider::new(&mut v, 0.0..=1.0).text("Vol")).changed() { self.out_volume.store(v.to_bits(), Ordering::Relaxed); self.force_save(); }
+            if ui.add(egui::Slider::new(&mut self.buffer_size_ms, 20..=10000).text("Delay ms")).changed() { let _ = self.command_tx.send(AudioCommand::UpdateBufferSize(self.buffer_size_ms)); self.force_save(); }
+            for i in 0..2 { ui.add(egui::ProgressBar::new(f32::from_bits(self.output_levels[i].load(Ordering::Relaxed)).min(1.0)).desired_width(350.0)); }
+        });
+    }
+
+    fn show_latency_plot(&self, ui: &mut egui::Ui) {
+        let h = ui.available_height() - 100.0;
+        ui.vertical_centered(|ui| {
+            ui.label(egui::RichText::new("NETWORK STABILITY").strong().small());
+            let pts: PlotPoints = self.latency_history.iter().enumerate().map(|(i, &v)| [i as f64, v]).collect();
+            Plot::new("j").height(h.max(60.0)).width(ui.available_width() * 0.95).allow_drag(false).include_y(0.0).include_y(100.0).show(ui, |p| p.line(Line::new(pts).color(egui::Color32::from_rgb(0, 162, 255)).fill(0.1)));
+        });
+    }
+
+    fn show_info_box(&self, ui: &mut egui::Ui) {
+        ui.add_space(20.0);
+        ui.group(|ui| { ui.vertical_centered(|ui| { ui.label(egui::RichText::new("AudioTX Pro").strong()); ui.label("Release 2024.1.0"); ui.label(format!("Cliente: {}", self.customer_name)); }); });
+    }
+}
+
+************* FINE FILE ************
+
+********** .cargo/config.toml **********
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+************* FINE FILE ************
+
+********** build_apk/AndroidManifest.xml **********
+
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.audiotx.audio_bridge"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="30" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    
+    <application android:label="AudioTX PRO" android:icon="@drawable/icon" android:hasCode="false">
+        <activity android:name="android.app.NativeActivity"
+            android:configChanges="orientation|keyboardHidden|screenSize"
+            android:exported="true">
+            
+            <meta-data android:name="android.app.lib_name" android:value="audio_bridge" />
+            
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+
+
+************* FINE FILE ************
+
