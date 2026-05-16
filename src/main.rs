@@ -141,7 +141,7 @@ fn wizard(h_id: &str) -> Config {
         out_volume: 1.0,
         selected_in: "Default".into(),
         selected_out: "Default".into(),
-        bitrate_kbps: 96,
+        bitrate_kbps: 128,
         customer_name: "Default User".into(),
         license_key: "".into(),
         mode: "BOTH".into(),
@@ -161,6 +161,19 @@ fn wizard(h_id: &str) -> Config {
     let _ = std::fs::write("config.json", serde_json::to_string_pretty(&cfg).unwrap());
     cfg
 }
+fn calcola_checksum_ipv4(buf: &[u8; 20]) -> u16 {
+    let mut sum = 0u32;
+    for i in (0..20).step_by(2) {
+        if i == 10 { continue; }
+        let word = ((buf[i] as u16) << 8) | (buf[i+1] as u16);
+        sum += word as u32;
+    }
+    while sum >> 16 > 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !sum as u16
+}
+
 fn start_audio_engine(
     mut cfg: Config, 
     cmd_rx: mpsc::Receiver<AudioCommand>, 
@@ -263,9 +276,11 @@ fn start_audio_engine(
         let (mut target, mut delay_pkts, mut active) = (cfg.target_ip.clone(), (cfg.buffer_size_ms / 20) as usize, cfg.autostart);
 
         let current_prod_in = Arc::new(Mutex::new(None));
-        let current_cons_in = Arc::new(Mutex::new(None));
-        let current_prod_out = Arc::new(Mutex::new(None));
-        let current_cons_out = Arc::new(Mutex::new(None));
+		let current_cons_in = Arc::new(Mutex::new(None));
+		let current_prod_out = Arc::new(Mutex::new(None));
+		let (_, mut _dummy_co) = ringbuf::HeapRb::<f32>::new(1).split();
+		let current_cons_out = Arc::new(Mutex::new(Some(_dummy_co)));
+
 
         let mut _s_in: Option<cpal::Stream> = None;
         let mut _s_out: Option<cpal::Stream> = None;
@@ -281,8 +296,8 @@ fn start_audio_engine(
 			.nth(1)
 			.and_then(|p| p.parse::<u16>().ok())
 			.unwrap_or(12345);
-
-
+		
+		let _ = enc.set_bitrate(Bitrate::Bits(cfg.bitrate_kbps as i32 * 1024)); 
         loop {
             // Se l'utente ha la VPN abilitata e non siamo in errore, forziamo lo stato "Tenta Connessione"
             if cfg.vpn_enabled && wg_tunnel.is_some() {
@@ -291,28 +306,46 @@ fn start_audio_engine(
                 }
             }
 
-            while let Ok(cmd) = cmd_rx.try_recv() {
-                match cmd {
-                    AudioCommand::SetTransmitting(s) => {
-                        if !s && active {
-                            let last_pkt = pack_bin(0, 1, &[]);
-                            if let Ok(sock) = current_socket.lock() {
-                                if cfg.vpn_enabled && wg_tunnel.is_some() {
-                                    let mut wg_buf = [0u8; 2048];
-                                    if let Some(ref mut tunnel) = wg_tunnel {
-                                        if let boringtun::noise::TunnResult::WriteToNetwork(wg_data) = tunnel.encapsulate(&last_pkt, &mut wg_buf) {
-                                            sock.send_to(wg_data, &cfg.vpn_endpoint).ok();
-                                        }
-                                    }
-                                } else {
-                                    sock.send_to(&last_pkt, &target).ok();
-                                }
-                            }
-                            j_map.clear();
-                        }
-                        active = s;
-                    },
-                    AudioCommand::UpdateTarget(t) => target = t,
+			while let Ok(cmd) = cmd_rx.try_recv() {
+				match cmd {
+					AudioCommand::SetTransmitting(s) => {
+						if s {
+							// 1. Svuota istantaneamente il Jitter Buffer
+							j_map.clear();
+							
+							// 2. Svuota i residui di campioni f32 nella RingBuffer di output di CPAL
+							if let Ok(mut cons_guard) = current_cons_out.lock() {
+								if let Some(ref mut consumer) = *cons_guard {
+									while let Some(campione) = consumer.pop() {
+										let _campione_audio: f32 = campione;
+									}
+								}
+							}
+							
+							// 3. Ripristina il decoder Opus per evitare artefatti matematici
+							if let Ok(nuovo_dec) = Decoder::new(48000, Channels::Stereo) {
+								dec = nuovo_dec;
+							}
+						} else if active {
+							// Se si sta spegnendo la trasmissione attuale, invia il pacchetto di chiusura (ctrl = 1)
+							let last_pkt = pack_bin(0, 1, &[]);
+							if let Ok(sock) = current_socket.lock() {
+								if cfg.vpn_enabled && wg_tunnel.is_some() {
+									let mut wg_buf = [0u8; 2048];
+									if let Some(ref mut tunnel) = wg_tunnel {
+										if let boringtun::noise::TunnResult::WriteToNetwork(wg_data) = tunnel.encapsulate(&last_pkt, &mut wg_buf) {
+											sock.send_to(wg_data, &cfg.vpn_endpoint).ok();
+										}
+									}
+								} else {
+									sock.send_to(&last_pkt, &target).ok();
+								}
+							}
+							j_map.clear();
+						}
+						active = s;
+					},
+					AudioCommand::UpdateTarget(t) => target = t,
                     AudioCommand::UpdateBitrate(b) => { let _ = enc.set_bitrate(Bitrate::Bits(b as i32 * 1024)); },
                     AudioCommand::UpdateBufferSize(ms) => { delay_pkts = (ms / 20) as usize; j_map.clear(); },
                     AudioCommand::UpdateInputDevice(n) => pin = Some(n),
@@ -427,8 +460,9 @@ fn start_audio_engine(
                 if let Some(d) = host.output_devices().unwrap().find(|x| x.name().unwrap_or_default() == n).or(host.default_output_device()) {
                     let conf = cpal::StreamConfig { channels: 2, sample_rate: cpal::SampleRate(48000), buffer_size: cpal::BufferSize::Default };
                     let (pi, co) = HeapRb::<f32>::new(192000).split();
-                    *current_prod_out.lock().unwrap() = Some(pi); *current_cons_out.lock().unwrap() = Some(co);
-                    let v = vo.clone(); let lv = output_lvls.clone(); let c_out_ptr = current_cons_out.clone();
+					*current_prod_out.lock().unwrap() = Some(pi);
+					*current_cons_out.lock().unwrap() = Some(co);
+					let v = vo.clone(); let lv = output_lvls.clone(); let c_out_ptr = current_cons_out.clone();
                     
                     _s_out = d.build_output_stream(&conf, move |data: &mut [f32], _| {
                         if let Some(ref mut co) = *c_out_ptr.lock().unwrap() {
@@ -454,7 +488,7 @@ fn start_audio_engine(
                         // =========================================================================
                         // --- ENVELOPE IP/UDP CON PORTA DINAMICA ESTRATTA DAL CONFIG ---
                         // =========================================================================
-                        if let Ok(sz) = encode_res {
+                                                if let Ok(sz) = encode_res {
                             let pkt = pack_bin(seq_tx, 0, &out_b[..sz]);
                             
                             if cfg.vpn_enabled && wg_tunnel.is_some() {
@@ -473,22 +507,47 @@ fn start_audio_engine(
                                     header_28b[8] = 64;   // TTL
                                     header_28b[9] = 17;   // Protocollo UDP
                                     
-                                    // IP Sorgente dal file JSON
+                                    // IP Sorgente dal file JSON (es: 192.168.11.201)
                                     if let Ok(src_ip) = cfg.vpn_local_ip.parse::<std::net::Ipv4Addr>() {
                                         header_28b[12..16].copy_from_slice(&src_ip.octets());
                                     }
                                     
-                                    // IP Destinazione forzato sul Gateway del MikroTik per l'Allowed IP userspace
-                                    let gateway_mikrotik = std::net::Ipv4Addr::new(192, 168, 11, 1);
-                                    header_28b[16..20].copy_from_slice(&gateway_mikrotik.octets());
+                                    // === CORREZIONE CRUCIALE: IP DESTINAZIONE REALE ===
+                                    // Non dobbiamo forzare il Gateway del MikroTik (.11.1), altrimenti il router terrà il pacchetto per sé!
+                                    // Dobbiamo estrarre l'IP della VPN del destinatario dalla variabile `target` o configurazione.
+                                    // Se la stringa `target` contiene l'IP virtuale del destinatario (es. "192.168.11.202:3334"), facciamo il parsing:
+                                    let ip_destinazione_reale = if let Ok(dst_socket) = target.parse::<std::net::SocketAddr>() {
+                                        if let std::net::IpAddr::V4(ipv4) = dst_socket.ip() {
+                                            ipv4
+                                        } else {
+                                            std::net::Ipv4Addr::new(192, 168, 11, 202) // Fallback se non valido
+                                        }
+                                    } else {
+                                        std::net::Ipv4Addr::new(192, 168, 11, 202) // Fallback RPi01
+                                    };
+                                    header_28b[16..20].copy_from_slice(&ip_destinazione_reale.octets());
+                                    // ==================================================
                                     
-                                    // 2. SCRITTURA PORTE DINAMICHE DA CONFIGURAZIONE (Nessun calcolo a caldo nel loop!)
-                                    let porta_sorgente: u16 = cfg.local_port as u16; // Es: 3333 dal JSON
+                                    // 2. SCRITTURA PORTE DINAMICHE DA CONFIGURAZIONE
+                                    let porta_sorgente: u16 = cfg.local_port as u16; 
                                     
                                     header_28b[20..22].copy_from_slice(&porta_sorgente.to_be_bytes());
                                     header_28b[22..24].copy_from_slice(&porta_destinazione_dinamica.to_be_bytes());
                                     header_28b[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
-                                    // header_28b[26..28] (Checksum UDP) rimane 0
+                                    
+                                    // === CALCOLO DEL CHECKSUM IPV4 ===
+                                    let mut sum = 0u32;
+                                    for idx in (0..20).step_by(2) {
+                                        let word = ((header_28b[idx] as u16) << 8) | (header_28b[idx + 1] as u16);
+                                        sum += word as u32;
+                                    }
+                                    while sum >> 16 > 0 {
+                                        sum = (sum & 0xFFFF) + (sum >> 16);
+                                    }
+                                    let checksum_ip = (!sum) as u16;
+                                    
+                                    header_28b[10] = ((checksum_ip >> 8) & 0xFF) as u8;
+                                    header_28b[11] = (checksum_ip & 0xFF) as u8;
                                     
                                     // Assemblaggio finale del frame IP/UDP + Audio Opus custom
                                     let mut frame_completo = Vec::with_capacity(total_len);
@@ -504,7 +563,6 @@ fn start_audio_engine(
                             }
                             b_tx += pkt.len(); seq_tx += 1;
                         }
-
                     }
                 }
             } else if active && !is_licensed_active {
@@ -537,27 +595,20 @@ fn start_audio_engine(
             }
 
             // =========================================================================
-            // --- CORE RICEZIONE RETE USERSPACE CON AGGANCIO IP VIRTUAL GATEWAY ---
+            // --- CORE RICEZIONE RETE USERSPACE RETTIFICATO CON PASSTHROUGH IP ---
             // =========================================================================
             let mut buf = [0u8; 2048];
             let mut read_res = None;
             if let Ok(sock) = current_socket.lock() { read_res = sock.recv_from(&mut buf).ok(); }
-            
+
             if let Some((n, addr)) = read_res {
                 let mut pacchetto_elaborabile = Some(buf[..n].to_vec());
-                
+
                 if cfg.vpn_enabled && wg_tunnel.is_some() {
                     let mut decrypted_buf = [0u8; 2048];
                     if let Some(ref mut tunnel) = wg_tunnel {
-                        
-                        // SBLOCCO CRITTOGRAFICO ASSOLUTO: Forziamo l'IP virtuale interno del MikroTik (192.168.11.1)
-                        // Questo bypassa i vincoli di anti-spoofing di boringtun, indicandogli che il mittente 
-                        // appartiene legalmente alla classe autorizzata /24, sbloccando la decodifica dell'audio!
-                        let ip_virtuale_mikrotik = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 11, 1));
-
-                        match tunnel.decapsulate(Some(ip_virtuale_mikrotik), &buf[..n], &mut decrypted_buf) {
+                        match tunnel.decapsulate(None, &buf[..n], &mut decrypted_buf) {
                             boringtun::noise::TunnResult::WriteToTunnelV4(dec_data, _) => {
-                                // RICEZIONE CONFERMATA: Il tunnel ha estratto l'audio in chiaro!
                                 if vpn_status.load(std::sync::atomic::Ordering::Relaxed) != 2 {
                                     vpn_status.store(2, std::sync::atomic::Ordering::Relaxed);
                                 }
@@ -569,13 +620,9 @@ fn start_audio_engine(
                                 pacchetto_elaborabile = None;
                             },
                             boringtun::noise::TunnResult::Done => {
-                                if vpn_status.load(std::sync::atomic::Ordering::Relaxed) != 2 {
-                                    vpn_status.store(2, std::sync::atomic::Ordering::Relaxed);
-                                }
                                 pacchetto_elaborabile = None;
                             },
                             boringtun::noise::TunnResult::Err(err) => {
-                                // Filtra l'errore di timeout periodico per non sporcare la console
                                 if !format!("{:?}", err).contains("ConnectionExpired") {
                                     log_vpn(&format!("❌ Errore crittografico: {:?}", err));
                                 }
@@ -585,36 +632,49 @@ fn start_audio_engine(
                         }
                     }
                 }
-
-                // --- PIPELINE DI DISTRIBUZIONE ALL'ENGINE AUDIO ---
+                 // --- PIPELINE DI DISTRIBUZIONE ALL'ENGINE AUDIO CON FILTRO ICMP ---
                 if let Some(pkt_raw) = pacchetto_elaborabile {
-                    // Quando boringtun estrae il pacchetto nello stato WriteToTunnelV4, 
-                    // restituisce solo l'UDP finto (8 byte). Saltiamo questi 8 byte per leggere unpack_bin!
-                    let dati_audio_reali = if cfg.vpn_enabled && pkt_raw.len() > 8 {
-                        &pkt_raw[8..]
+                    
+                    // CONTROLLO DI SICUREZZA ANTI-ICMP
+                    // Se il pacchetto IPv4 decapsulato indica il protocollo 1 (ICMP), lo ignoriamo.
+                    // Questo evita che i messaggi di errore "Port Unreachable" del MikroTik sporchino la telemetria.
+                    if cfg.vpn_enabled && pkt_raw.len() >= 20 && pkt_raw[9] == 1 {
+                        // Saltiamo il pacchetto ICMP parassita senza incrementare i VU-meter audio
+                        continue;
+                    }
+
+                    // Se arriviamo qui, il pacchetto è un UDP reale (pkt_raw[9] == 17)
+                    let dati_audio_reali = if cfg.vpn_enabled {
+                        if pkt_raw.len() > 28 {
+                            &pkt_raw[28..] // Taglia i 28 byte di Header IP + UDP reale decapsulato
+                        } else {
+                            &pkt_raw[..]
+                        }
                     } else {
                         &pkt_raw[..]
                     };
 
                     if let Some((seq, ctrl, data)) = unpack_bin(dati_audio_reali) {
-                        // INCREMENTO TELEMETRIA: Alimenta i kbps dell'interfaccia grafica uscando dallo zero!
-                        b_rx += n; 
+                        b_rx += n;
                         
                         match ctrl {
                             0 => {
-                                // Flusso audio Opus valido: inserimento nel Jitter Buffer
-                                let ora = Instant::now(); 
+                                let ora = Instant::now();
                                 let mut lp_lock = lp.lock().unwrap();
-                                let diff = ora.duration_since(*lp_lock).as_secs_f64() * 1000.0; 
+                                let diff = ora.duration_since(*lp_lock).as_secs_f64() * 1000.0;
                                 *lp_lock = ora;
                                 
                                 if let Ok(mut ra_guard) = ra.lock() {
-                                    *ra_guard = addr.to_string(); // Mostra l'IP sorgente reale nei log
+                                    *ra_guard = addr.to_string(); 
                                 }
-                                j_map.insert(seq, data); 
+                                
+                                j_map.insert(seq, data);
                                 let _ = jitter_tx.send(diff.min(100.0));
                             },
-                            1 => { j_map.clear(); },
+                            1 => {
+                                j_map.clear();
+                                let _ = jitter_tx.send(-1.0);
+                            },
                             _ => {}
                         }
                     }
@@ -788,7 +848,7 @@ pub fn main() -> Result<(), eframe::Error> {
             out_volume: 1.0,
             selected_in: "Default".into(),
             selected_out: "Default".into(),
-            bitrate_kbps: 96,
+            bitrate_kbps: 128,
             customer_name: "Default User".into(),
             license_key: "".into(),
             mode: "BOTH".into(),
@@ -927,6 +987,7 @@ fn main() -> Result<(), ()> {
         println!("  --url-tx <ip:p>    Imposta l'indirizzo IP e la porta di destinazione della trasmissione");
         println!("  --port-rx <p>      Imposta la porta UDP locale in ascolto per la ricezione");
         println!("  --buffer <ms>      Imposta la dimensione del buffer di jitter in millisecondi");
+        println!("  --bitrate <kb>     Imposta il bitrate del flusso audio in kb (32, 64, 96, 128, 160,192,256,320)");
         println!("  --set-audio-tx <n> Imposta la scheda audio fissa da usare per l'input (TX)");
         println!("  --set-audio-rx <n> Imposta la scheda audio fissa da usare per l'output (RX)");
         println!("  --autostart <t/f>  Abilita (true) o disabilita (false) l'avvio automatico della trasmissione");
@@ -984,6 +1045,7 @@ fn main() -> Result<(), ()> {
             "--url-tx" if i + 1 < args.len() => { cfg.target_ip = args[i + 1].clone(); agg_cfg = true; i += 2; }
             "--port-rx" if i + 1 < args.len() => { if let Ok(p) = args[i + 1].parse::<u16>() { cfg.local_port = p; agg_cfg = true; } i += 2; }
             "--buffer" if i + 1 < args.len() => { if let Ok(b) = args[i + 1].parse::<u32>() { cfg.buffer_size_ms = b; agg_cfg = true; } i += 2; }
+            "--bitrate" if i + 1 < args.len() => { if let Ok(b) = args[i + 1].parse::<u32>() { cfg.bitrate_kbps = b; agg_cfg = true; } i += 2; }
             "--set-audio-tx" if i + 1 < args.len() => { cfg.selected_in = args[i + 1].clone(); agg_cfg = true; i += 2; }
             "--set-audio-rx" if i + 1 < args.len() => { cfg.selected_out = args[i + 1].clone(); agg_cfg = true; i += 2; }
             
@@ -1049,6 +1111,7 @@ fn main() -> Result<(), ()> {
     println!(" -> Destinazione Remota     : {}", cfg.target_ip);
     println!(" -> Ascolto UDP Locale      : {}", cfg.local_port);
     println!(" -> Buffer ritardo in ms    : {}", cfg.buffer_size_ms);
+    println!(" -> Bitrate                 : {}", cfg.bitrate_kbps);
     println!(" -> Avvio Automatico (Boot) : {}", cfg.autostart);
     println!(" -> Stato VPN WireGuard     : {}", if cfg.vpn_enabled { "ATTIVATA" } else { " DISATTIVATA" });
     

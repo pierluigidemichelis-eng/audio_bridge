@@ -136,25 +136,29 @@ impl eframe::App for AudioApp {
                         .font(egui::FontId::monospace(12.0))
                         .color(colore_rx_spia));
                     
-                    ui.separator();
-                    ui.label(egui::RichText::new(format!("HWID: {}", self.hwid)).weak());
-                });
-            });
+					ui. separator();
+					ui. label( egui:: RichText:: new( format!("HWID: {}", self. hwid)). weak());
+					});
+				});
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Qui dentro risiede la tua gestione dei Tab (TX, RX, VPN)
-            // ... il resto del tuo layout originale ...
-        });
-        ctx.set_visuals(egui::Visuals::dark());
-        while let Ok(v) = self.jitter_rx.try_recv() {
-            if v < 0.0 { self.latency_history.clear(); }
-            else {
-                self.latency_history.push_back(v);
-                if self.latency_history.len() > 300 { self.latency_history.pop_front(); }
-            }
-        }
+				egui:: CentralPanel:: default(). show( ctx, |ui| {
+				// Qui dentro risiede la tua gestione dei Tab (TX, RX, VPN)
+				// ... il resto del tuo layout originale ...
+				});
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+				ctx. set_visuals( egui:: Visuals:: dark());
+
+				while let Ok( v) = self. jitter_rx. try_recv() {
+					if v < 0.0 {
+						self. latency_history. clear();
+					} else {
+						self. latency_history. push_back( v);
+						if self. latency_history. len() > 300 { self. latency_history. pop_front(); }
+					}
+				}
+
+			egui:: CentralPanel:: default(). show( ctx, |ui| {
+
             ui.vertical_centered(|ui| {
                 ui.add(egui::Image::new(egui::include_image!("../logo.png")).max_width(240.0));
                 ui.add_space(5.0);
